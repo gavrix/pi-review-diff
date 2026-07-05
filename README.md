@@ -1,16 +1,14 @@
 # Pi Review Diff
 
-A Pi extension that opens a local browser-based diff review UI for the current git working tree.
+Review your local changes in a web UI and send review feedback back into Pi.
 
-It lets you:
+- view diffs in a local web UI
+- add inline comments to diffs
+- include review comments in your next Pi prompt automatically
 
-- open a GitHub-like diff page with `/review-diff`
-- add line and range comments from the browser
-- see pending comments in Pi's widget area
-- inject pending comments into the next normal Pi prompt
-- remove pending comments from the browser page
-- refresh the diff when the page reloads, and after Pi agent turns finish
-- switch between VS Code-inspired light and dark themes
+## Screenshot
+
+![Pi Review Diff screenshot](./assets/review-diff.png)
 
 ## Install
 
@@ -32,12 +30,12 @@ In Pi, run:
 /review-diff
 ```
 
-The extension starts a loopback-only HTTP server on `127.0.0.1` with an OS-assigned ephemeral port and opens the review page in your browser.
+Add comments in the browser, then continue in Pi as usual.
 
-Add comments in the browser. Pending comments will be included automatically in the next normal prompt you send to Pi. Slash commands and bash commands are ignored.
+## Credits
 
-## Security notes
+Built as a Pi extension.
 
-This extension runs locally with the same permissions as Pi. It reads the current repository diff using git and serves it to a browser page on `127.0.0.1` only.
+## License
 
-Review the source before installing any Pi package.
+MIT. See [LICENSE](./LICENSE).
