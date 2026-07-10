@@ -1,6 +1,6 @@
 import { execFile } from "node:child_process";
 import * as crypto from "node:crypto";
-import { mkdtemp, rm } from "node:fs/promises";
+import { copyFile, mkdtemp, rm } from "node:fs/promises";
 import * as http from "node:http";
 import type { AddressInfo } from "node:net";
 import { tmpdir } from "node:os";
@@ -321,10 +321,45 @@ function runGitWithIndex(gitRoot: string, indexPath: string, args: string[]): Pr
 	});
 }
 
+function runGitCapture(gitRoot: string, args: string[]): Promise<string> {
+	return new Promise((resolve, reject) => {
+		execFile("git", args, { cwd: gitRoot, maxBuffer: MAX_DIFF_BYTES * 2 }, (error, stdout, stderr) => {
+			if (error) {
+				reject(new Error(stderr.trim() || stdout.trim() || error.message));
+				return;
+			}
+			resolve(stdout.trim());
+		});
+	});
+}
+
+// Seed a temp index from the repo's real index so Git keeps its cached stat
+// data (plus the untracked and fsmonitor caches). Without this, `git add -A`
+// re-hashes every file in the worktree, which is multi-second on large repos.
+async function seedIndexFromRepo(gitRoot: string, indexPath: string): Promise<boolean> {
+	try {
+		const gitDir = await runGitCapture(gitRoot, ["rev-parse", "--absolute-git-dir"]);
+		if (!gitDir) return false;
+		await copyFile(join(gitDir, "index"), indexPath);
+		return true;
+	} catch {
+		return false;
+	}
+}
+
 async function captureWorktreeTree(gitRoot: string): Promise<string> {
 	const tempDir = await mkdtemp(join(tmpdir(), "pi-review-diff-"));
 	const indexPath = join(tempDir, "index");
 	try {
+		if (await seedIndexFromRepo(gitRoot, indexPath)) {
+			try {
+				await runGitWithIndex(gitRoot, indexPath, ["add", "-A", "--", "."]);
+				return await runGitWithIndex(gitRoot, indexPath, ["write-tree"]);
+			} catch {
+				// Seeded index was unusable (e.g. a split-index edge case).
+				// Fall through and rebuild a fresh index below.
+			}
+		}
 		try {
 			await runGitWithIndex(gitRoot, indexPath, ["read-tree", "HEAD"]);
 		} catch {
@@ -940,6 +975,9 @@ button.file-header:hover { background:var(--comment); }
 .file-comment-count { color:var(--accent); font-size:11px; font-weight:550; }
 .file-body { display:grid; grid-template-rows:1fr; min-width:0; overflow:clip; border-radius:0 0 9px 9px; opacity:1; transition:grid-template-rows .2s ease, opacity .14s ease; }
 .file-body-inner { min-height:0; overflow-x:auto; overflow-y:hidden; background:var(--bg); }
+@keyframes flash-file { 0% { box-shadow:inset 0 0 0 2px var(--accent); background:color-mix(in srgb, var(--accent) 16%, var(--panel)); } 100% { box-shadow:inset 0 0 0 2px transparent; background:var(--panel); } }
+.file.flash-target { animation:flash-file 1.15s ease-out; }
+::highlight(review-search) { background-color:color-mix(in srgb, var(--accent) 55%, transparent); color:var(--text); }
 .file.is-collapsed .file-body { grid-template-rows:0fr; opacity:0; }
 .hunk-header { padding:6px 13px; color:color-mix(in srgb, var(--accent) 70%, var(--text)); background:color-mix(in srgb, var(--panel) 85%, var(--accent)); border-top:1px solid var(--border); border-bottom:1px solid var(--border); font:11.5px/1.5 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
 .hunk-header:first-child { border-top:0; }
@@ -1005,7 +1043,7 @@ body.is-dragging-comment button.line-plus { pointer-events:none; }
 .empty, .error { display:grid; place-items:center; min-height:220px; padding:32px; color:var(--muted); text-align:center; background:var(--panel); border:1px dashed var(--border); border-radius:10px; }
 .error { color:var(--del-fg); }
 @media (max-width:760px) { header { padding:10px 12px; } .branch-comparison { max-width:34vw; } .file-menu-button { margin-left:auto; } main { padding:12px; } .theme-wrap { display:none; } }
-@media (prefers-reduced-motion:reduce) { .file-body, .file-chevron::before, .chevron-down { transition:none; } .activity-dot, .mode-option.is-live .mode-check { animation:none; } }
+@media (prefers-reduced-motion:reduce) { .file-body, .file-chevron::before, .chevron-down { transition:none; } .activity-dot, .mode-option.is-live .mode-check, .file.flash-target { animation:none; } }
 </style>
 </head>
 <body>
@@ -1104,6 +1142,7 @@ let dragState = null;
 let activeFilePath = null;
 let activeFileTimer = null;
 let diffResizeObserver = null;
+let fileBodyObserver = null;
 const collapsedFiles = new Set();
 const collapsedTreeDirs = new Set();
 const ICON_COLLAPSE_ALL = '<svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m7 20 5-5 5 5"/><path d="m7 4 5 5 5-5"/></svg>';
@@ -1504,6 +1543,8 @@ function setAllFilesCollapsed(collapsed) {
     if (header) header.setAttribute('aria-expanded', collapsed ? 'false' : 'true');
   });
   clearOpenForms();
+  if (!collapsed) { observeFileBodies(); renderVisibleFileBodies(); }
+  else if (fileBodyObserver) fileBodyObserver.disconnect();
   updateCollapseToggle();
 }
 function fuzzyMatch(query, text) {
@@ -1696,6 +1737,134 @@ function observeDiffViewportWidths() {
   diffResizeObserver = new ResizeObserver(entries => entries.forEach(entry => sync(entry.target)));
   viewports.forEach(viewport => diffResizeObserver.observe(viewport));
 }
+function buildFileBodyHtml(file) {
+  const filePath = file.newPath === '/dev/null' ? file.oldPath : file.newPath;
+  if (file.isBinary) return '<div class="empty">Binary file diff cannot be annotated.</div>';
+  return file.hunks.map((hunk, hunkIndex) => {
+    const showOldNumbers = hunkShowsOldNumbers(hunk);
+    const showNewNumbers = hunkShowsNewNumbers(hunk);
+    const rows = hunk.lines.map((line, lineIndex) => {
+      const key = keyFor(filePath, hunk.header, line);
+      const baseCls = line.kind === 'add' ? 'add' : line.kind === 'delete' ? 'delete' : line.kind === 'meta' ? 'meta-line' : 'context';
+      const cls = baseCls + (hasMultiLineCommentOnLine(filePath, hunk, line) ? ' commented-range' : '');
+      const marker = lineMarker(line);
+      const oldNum = line.oldLine || '';
+      const newNum = line.newLine || '';
+      const anchoredComments = commentsForAnchor(filePath, hunk, lineIndex);
+      const comments = renderCommentsFor(anchoredComments);
+      const plus = line.kind === 'meta' || review.mode === 'active-turn' ? '' : '<button class="line-plus" data-action="start-comment" aria-label="Add comment" title="Add comment. Drag to select multiple lines">+</button>';
+      const plusOnOld = showOldNumbers && (!showNewNumbers || line.kind === 'delete' || (line.kind === 'context' && !newNum));
+      const oldNumClass = 'num' + (plus && plusOnOld ? ' comment-target' : '');
+      const newNumClass = 'num' + (plus && !plusOnOld ? ' comment-target' : '');
+      const oldCell = showOldNumbers ? '<td class="' + oldNumClass + '"><span class="line-number-text">' + oldNum + '</span>' + (plusOnOld ? plus : '') + '</td>' : '';
+      const newCell = showNewNumbers ? '<td class="' + newNumClass + '"><span class="line-number-text">' + newNum + '</span>' + (!plusOnOld ? plus : '') + '</td>' : '';
+      const codeMarker = marker === ' ' ? '&nbsp;' : escapeHtml(marker);
+      return '<tr class="line ' + cls + '" data-file-path="' + escapeHtml(filePath) + '" data-hunk="' + escapeHtml(hunk.header) + '" data-hunk-index="' + hunkIndex + '" data-line-index="' + lineIndex + '" data-key="' + escapeHtml(key) + '">' +
+        oldCell + newCell + '<td class="code"><span class="code-marker">' + codeMarker + '</span>' + highlightCodeLine(filePath, line.content) + '</td></tr>' +
+        (comments ? commentRowHtml(hunk, comments) : '');
+    }).join('');
+    return '<div class="hunk-header">' + escapeHtml(hunk.header) + '</div><table class="diff"><tbody>' + rows + '</tbody></table>';
+  }).join('');
+}
+function ensureFileBody(section) {
+  if (!section) return;
+  const inner = section.querySelector('.file-body-inner');
+  if (!inner || inner.dataset.rendered === '1') return;
+  const fileIndex = Number(section.dataset.fileIndex);
+  const file = review.files[fileIndex];
+  if (!file) return;
+  inner.innerHTML = buildFileBodyHtml(file);
+  inner.dataset.rendered = '1';
+  inner.style.setProperty('--diff-viewport-width', inner.clientWidth + 'px');
+  highlightSearchInBody(inner);
+  if (fileBodyObserver) fileBodyObserver.unobserve(section);
+}
+function observeFileBodies() {
+  if (fileBodyObserver) { fileBodyObserver.disconnect(); fileBodyObserver = null; }
+  const sections = Array.from(document.querySelectorAll('.file'));
+  if (typeof IntersectionObserver === 'undefined') { sections.forEach(ensureFileBody); return; }
+  fileBodyObserver = new IntersectionObserver(entries => {
+    for (const entry of entries) {
+      if (entry.isIntersecting && !entry.target.classList.contains('is-collapsed')) ensureFileBody(entry.target);
+    }
+  }, { rootMargin: '1200px 0px' });
+  for (const section of sections) if (!section.classList.contains('is-collapsed')) fileBodyObserver.observe(section);
+}
+function renderVisibleFileBodies() {
+  const vh = window.innerHeight || 800;
+  for (const section of document.querySelectorAll('.file')) {
+    if (section.classList.contains('is-collapsed')) continue;
+    const rect = section.getBoundingClientRect();
+    if (rect.top <= vh + 600 && rect.bottom >= -600) ensureFileBody(section);
+  }
+}
+function revealFile(section) {
+  if (!section) return;
+  const header = section.querySelector('.file-header');
+  const filePath = header && header.dataset ? header.dataset.filePath : null;
+  if (filePath && collapsedFiles.has(filePath)) {
+    collapsedFiles.delete(filePath);
+    section.classList.remove('is-collapsed');
+    if (header) header.setAttribute('aria-expanded', 'true');
+    updateCollapseToggle();
+  }
+  ensureFileBody(section);
+  section.scrollIntoView({ block:'start' });
+  section.classList.remove('flash-target');
+  void section.offsetWidth;
+  section.classList.add('flash-target');
+  clearTimeout(section._flashTimer);
+  section._flashTimer = setTimeout(() => section.classList.remove('flash-target'), 1300);
+}
+function searchQuery() {
+  const input = document.getElementById('file-filter');
+  return (input && input.value ? input.value : '').trim();
+}
+function collectSearchRanges(root, q, out) {
+  const walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT, {
+    acceptNode(node) {
+      const parent = node.parentElement;
+      if (!parent || !parent.closest('td.code')) return NodeFilter.FILTER_REJECT;
+      return node.nodeValue && node.nodeValue.toLowerCase().includes(q) ? NodeFilter.FILTER_ACCEPT : NodeFilter.FILTER_REJECT;
+    }
+  });
+  let node;
+  while ((node = walker.nextNode())) {
+    const lower = node.nodeValue.toLowerCase();
+    let idx = 0;
+    while ((idx = lower.indexOf(q, idx)) !== -1) {
+      const range = document.createRange();
+      range.setStart(node, idx);
+      range.setEnd(node, idx + q.length);
+      out.push(range);
+      idx += q.length;
+    }
+  }
+}
+function searchHighlightSupported() {
+  return typeof CSS !== 'undefined' && CSS.highlights && typeof Highlight !== 'undefined';
+}
+function refreshSearchHighlights() {
+  if (!searchHighlightSupported()) return;
+  CSS.highlights.delete('review-search');
+  const q = searchQuery().toLowerCase();
+  if (q.length < 2) return;
+  const content = document.getElementById('content');
+  if (!content) return;
+  const ranges = [];
+  collectSearchRanges(content, q, ranges);
+  if (ranges.length) CSS.highlights.set('review-search', new Highlight(...ranges));
+}
+function highlightSearchInBody(inner) {
+  if (!searchHighlightSupported()) return;
+  const q = searchQuery().toLowerCase();
+  if (q.length < 2) return;
+  let highlight = CSS.highlights.get('review-search');
+  if (!highlight) { highlight = new Highlight(); CSS.highlights.set('review-search', highlight); }
+  const ranges = [];
+  collectSearchRanges(inner, q, ranges);
+  for (const range of ranges) highlight.add(range);
+}
 function render() {
   renderModeMenu();
   renderSidebar();
@@ -1726,38 +1895,11 @@ function render() {
       (pendingForFile ? '<span class="file-comment-count">' + pendingForFile + ' pending</span>' : '') +
       '<span class="file-change-stats"><span class="additions">+' + stats.additions + '</span><span class="deletions">−' + stats.deletions + '</span></span></button>';
     const sectionClass = 'file' + (collapsed ? ' is-collapsed' : '');
-    let bodyContent = '';
-    if (file.isBinary) {
-      bodyContent = '<div class="empty">Binary file diff cannot be annotated.</div>';
-    } else {
-      bodyContent = file.hunks.map((hunk, hunkIndex) => {
-        const showOldNumbers = hunkShowsOldNumbers(hunk);
-        const showNewNumbers = hunkShowsNewNumbers(hunk);
-        const rows = hunk.lines.map((line, lineIndex) => {
-          const key = keyFor(filePath, hunk.header, line);
-          const baseCls = line.kind === 'add' ? 'add' : line.kind === 'delete' ? 'delete' : line.kind === 'meta' ? 'meta-line' : 'context';
-          const cls = baseCls + (hasMultiLineCommentOnLine(filePath, hunk, line) ? ' commented-range' : '');
-          const marker = lineMarker(line);
-          const oldNum = line.oldLine || '';
-          const newNum = line.newLine || '';
-          const anchoredComments = commentsForAnchor(filePath, hunk, lineIndex);
-          const comments = renderCommentsFor(anchoredComments);
-          const plus = line.kind === 'meta' || review.mode === 'active-turn' ? '' : '<button class="line-plus" data-action="start-comment" aria-label="Add comment" title="Add comment. Drag to select multiple lines">+</button>';
-          const plusOnOld = showOldNumbers && (!showNewNumbers || line.kind === 'delete' || (line.kind === 'context' && !newNum));
-          const oldNumClass = 'num' + (plus && plusOnOld ? ' comment-target' : '');
-          const newNumClass = 'num' + (plus && !plusOnOld ? ' comment-target' : '');
-          const oldCell = showOldNumbers ? '<td class="' + oldNumClass + '"><span class="line-number-text">' + oldNum + '</span>' + (plusOnOld ? plus : '') + '</td>' : '';
-          const newCell = showNewNumbers ? '<td class="' + newNumClass + '"><span class="line-number-text">' + newNum + '</span>' + (!plusOnOld ? plus : '') + '</td>' : '';
-          const codeMarker = marker === ' ' ? '&nbsp;' : escapeHtml(marker);
-          return '<tr class="line ' + cls + '" data-file-path="' + escapeHtml(filePath) + '" data-hunk="' + escapeHtml(hunk.header) + '" data-hunk-index="' + hunkIndex + '" data-line-index="' + lineIndex + '" data-key="' + escapeHtml(key) + '">' +
-            oldCell + newCell + '<td class="code"><span class="code-marker">' + codeMarker + '</span>' + highlightCodeLine(filePath, line.content) + '</td></tr>' +
-            (comments ? commentRowHtml(hunk, comments) : '');
-        }).join('');
-        return '<div class="hunk-header">' + escapeHtml(hunk.header) + '</div><table class="diff"><tbody>' + rows + '</tbody></table>';
-      }).join('');
-    }
-    return '<section class="' + sectionClass + '" id="file-' + fileIndex + '" style="contain-intrinsic-size:auto ' + estHeight + 'px">' + fileHeader + '<div class="file-body"><div class="file-body-inner">' + bodyContent + '</div></div></section>';
+    return '<section class="' + sectionClass + '" id="file-' + fileIndex + '" data-file-index="' + fileIndex + '" style="contain-intrinsic-size:auto ' + estHeight + 'px">' + fileHeader + '<div class="file-body"><div class="file-body-inner" data-file-index="' + fileIndex + '"></div></div></section>';
   }).join('');
+  observeFileBodies();
+  renderVisibleFileBodies();
+  refreshSearchHighlights();
   observeDiffViewportWidths();
   queueActiveFileUpdate();
 }
@@ -1922,6 +2064,7 @@ document.addEventListener('keydown', (event) => {
     if (filter && document.activeElement === filter && filter.value) {
       filter.value = '';
       renderFileTree();
+      refreshSearchHighlights();
       return;
     }
     dragState = null;
@@ -1937,7 +2080,7 @@ document.addEventListener('keydown', (event) => {
   let timer = null;
   filter.addEventListener('input', () => {
     if (timer) clearTimeout(timer);
-    timer = setTimeout(() => { timer = null; renderFileTree(); }, 120);
+    timer = setTimeout(() => { timer = null; renderFileTree(); refreshSearchHighlights(); }, 120);
   });
 })();
 async function loadReview({ refresh = false } = {}) {
@@ -1987,7 +2130,7 @@ document.addEventListener('click', async (event) => {
     activeFilePath = fileLink.dataset.filePath || activeFilePath;
     setFilePopoverOpen(false);
     const target = document.querySelector(fileLink.getAttribute('href'));
-    if (target) target.scrollIntoView({ block:'start' });
+    revealFile(target);
     return;
   }
   const actionTarget = event.target.closest('[data-action]');
@@ -2040,6 +2183,7 @@ document.addEventListener('click', async (event) => {
       else collapsedFiles.delete(filePath);
       section.classList.toggle('is-collapsed', shouldCollapse);
       button.setAttribute('aria-expanded', shouldCollapse ? 'false' : 'true');
+      if (!shouldCollapse) ensureFileBody(section);
       updateCollapseToggle();
     }
     return;
