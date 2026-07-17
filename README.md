@@ -41,6 +41,10 @@ The review opens on **Branch**, comparing the current worktree with the merge ba
 
 Untracked files are included. Click the live activity pill to open **Active turn**; its dropdown entry lists the files changing so far. Add comments in the browser, then continue in Pi as usual. Pending comments are injected into the next normal prompt, marked as sent immediately, and considered resolved when that Pi run finishes.
 
+## Security
+
+The review server listens only on `127.0.0.1`. Each review uses a random, unguessable ID in its local URL; review data lives only in the Pi process and disappears when that process or session shuts down.
+
 ## Credits
 
 Built as a Pi extension.

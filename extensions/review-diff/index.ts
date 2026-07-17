@@ -99,7 +99,6 @@ type ReviewComment = {
 
 type Review = {
 	id: string;
-	token: string;
 	createdAt: number;
 	updatedAt: number;
 	diffVersion: number;
@@ -169,10 +168,6 @@ async function readRequestJson(req: http.IncomingMessage): Promise<unknown> {
 	}
 	const raw = Buffer.concat(chunks).toString("utf8");
 	return raw ? JSON.parse(raw) : {};
-}
-
-function requireReviewAuth(req: http.IncomingMessage, review: Review): boolean {
-	return req.headers.authorization === `Bearer ${review.token}`;
 }
 
 function parseHunkHeader(header: string): Pick<DiffHunk, "oldStart" | "oldCount" | "newStart" | "newCount"> | null {
@@ -695,11 +690,6 @@ function createRequestHandler(pi: ExtensionAPI): http.RequestListener {
 				jsonResponse(res, 404, { error: "Unknown review" });
 				return;
 			}
-			if (!requireReviewAuth(req, review)) {
-				jsonResponse(res, 401, { error: "Unauthorized" });
-				return;
-			}
-
 			if (req.method === "GET" && !suffix) {
 				if (parsedUrl.searchParams.get("refresh") === "1") await refreshReview(pi, review);
 				jsonResponse(res, 200, reviewResponse(review));
@@ -848,7 +838,6 @@ async function createReview(pi: ExtensionAPI, ctx: ExtensionContext): Promise<{ 
 	const capture = await captureDiff(pi, ctx.cwd, mode);
 	const review: Review = {
 		id: randomId("rvw"),
-		token: crypto.randomBytes(32).toString("base64url"),
 		createdAt: Date.now(),
 		updatedAt: Date.now(),
 		diffVersion: 1,
@@ -866,7 +855,7 @@ async function createReview(pi: ExtensionAPI, ctx: ExtensionContext): Promise<{ 
 		comments: [],
 	};
 	reviews.set(review.id, review);
-	return { review, url: `${server.baseUrl}/review/${review.id}#token=${review.token}`, truncated: capture.truncated };
+	return { review, url: `${server.baseUrl}/review/${review.id}`, truncated: capture.truncated };
 }
 
 const REVIEW_PAGE_HTML = String.raw`<!doctype html>
@@ -1086,13 +1075,6 @@ body.is-dragging-comment button.line-plus { pointer-events:none; }
 </button>
 <script>
 const reviewId = location.pathname.split('/').pop();
-const hash = new URLSearchParams(location.hash.slice(1));
-let token = hash.get('token') || sessionStorage.getItem('pi-review-token-' + reviewId);
-if (token) {
-  sessionStorage.setItem('pi-review-token-' + reviewId, token);
-  history.replaceState(null, '', location.pathname);
-}
-const headers = () => ({ 'Authorization': 'Bearer ' + token, 'Content-Type': 'application/json' });
 const THEMES = [
   { id:'linear-dark', label:'Linear Dark', scheme:'dark', colors:{ bg:'#0d0e10', panel:'#131416', text:'#e8e9eb', muted:'#8a8f98', accent:'#8b7cff', addBg:'#10251b', addFg:'#56c991', delBg:'#2a171a', delFg:'#f06d7a', border:'#292b30', comment:'#1a1c20' } },
   { id:'light-modern', label:'Light Modern', scheme:'light', colors:{ bg:'#ffffff', panel:'#f3f3f3', text:'#1f2328', muted:'#6e7781', accent:'#0969da', addBg:'#dafbe1', addFg:'#116329', delBg:'#ffebe9', delFg:'#cf222e', border:'#d0d7de', comment:'#f6f8fa' } },
@@ -1351,8 +1333,7 @@ function highlightCodeLine(filePath, line) {
   return language.highlight ? language.highlight(source) : highlightCLike(source, language.keywords);
 }
 async function api(path, opts = {}) {
-  if (!token) throw new Error('Missing review token');
-  const res = await fetch(path, { ...opts, headers: { ...headers(), ...(opts.headers || {}) } });
+  const res = await fetch(path, opts);
   const body = await res.json().catch(() => ({}));
   if (!res.ok) throw new Error(body.error || res.statusText);
   return body;
